@@ -573,10 +573,9 @@ namespace Antmicro.Renode.Peripherals.CAN
             case RegisterOffset.CAN_MCR:
                 registers.CAN_MCR.SetValue(value);
 
-                if(registers.CAN_MCR.InitRequest == true &&
-                   registers.CAN_MCR.SleepRequest == false)
+                if(registers.CAN_MCR.InitRequest == true)
                 {
-                    // Enter initialisation mode
+                    // Enter initialisation mode; INRQ takes priority over SLEEP per STM32 RM
                     registers.CAN_MSR.InitAck = true;
                     registers.CAN_MSR.SleepAck = false;
                 }

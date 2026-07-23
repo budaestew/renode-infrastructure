@@ -158,6 +158,7 @@ namespace Antmicro.Renode.Peripherals.DMA
             public void Reset()
             {
                 dataOffset = 0;
+                initialNrOfData = 0;
                 IRQ.Unset();
             }
 
@@ -198,7 +199,7 @@ namespace Antmicro.Renode.Peripherals.DMA
                     .WithFlag(4, out transferCompleteIrqEnable, name: "TCIE")
                     .WithTaggedFlag("PFCTRL", 5)
                     .WithEnumField(6, 2, out direction, name: "DIR")
-                    .WithTaggedFlag("CIRC", 8)
+                    .WithFlag(8, out circularMode, name: "CIRC")
                     .WithFlag(9, out peripheralIncrementOffset, name: "PINC")
                     .WithFlag(10, out memoryIncrementOffset, name: "MINC")
                     .WithEnumField(11, 2, out peripheralDataSize, name: "PSIZE")
@@ -213,7 +214,8 @@ namespace Antmicro.Renode.Peripherals.DMA
                     .WithReservedBits(25, 7);
 
                 (Registers.StreamNumberOfData + streamOffset).Define(parent)
-                    .WithValueField(0, 16, out nrOfData, name: "NDT")
+                    .WithValueField(0, 16, out nrOfData, name: "NDT",
+                        writeCallback: (_, value) => initialNrOfData = value)
                     .WithReservedBits(16, 16);
 
                 (Registers.StreamPeripheralAddress + streamOffset).Define(parent)
@@ -260,6 +262,12 @@ namespace Antmicro.Renode.Peripherals.DMA
                     {
                         parent.transferCompleteIrqStatus[id].Value = true;
                         dataOffset = 0;
+                        if(circularMode.Value)
+                        {
+                            // Circular mode: reload NDTR with the last value written to the
+                            // register and keep transferring, like the hardware does.
+                            nrOfData.Value = initialNrOfData;
+                        }
                         parent.UpdateInterrupts();
                     }
                 }
@@ -365,6 +373,8 @@ namespace Antmicro.Renode.Peripherals.DMA
             private int MemoryDataSizeInBytes => 1 << (int)memoryDataSize.Value;
 
             private IFlagRegisterField isEnabled;
+            private IFlagRegisterField circularMode;
+            private ulong initialNrOfData;
             private IFlagRegisterField transferCompleteIrqEnable;
             private IEnumRegisterField<Direction> direction;
             private IFlagRegisterField peripheralIncrementOffset;

@@ -153,11 +153,16 @@ namespace Antmicro.Renode.Peripherals.CRC
 
         private void UpdateCRC(uint value, int bytesCount)
         {
-            if(reverseInputData.Value == BitReversal.ByByte)
+            // reverseInputData is only registered when the series has ReversibleIO (F0, WBA).
+            // On series without it (F4) the field stays null, so any CRC_DR write would throw
+            // NullReferenceException. Default to no reversal, matching how ReloadCRCConfig
+            // already guards reverseOutputData/polySize.
+            var inputReversal = reverseInputData?.Value ?? BitReversal.Disabled;
+            if(inputReversal == BitReversal.ByByte)
             {
                 value = BitHelper.ReverseBitsByByte(value);
             }
-            else if(reverseInputData.Value == BitReversal.ByWord)
+            else if(inputReversal == BitReversal.ByWord)
             {
                 switch(bytesCount)
                 {
@@ -170,7 +175,7 @@ namespace Antmicro.Renode.Peripherals.CRC
                     break;
                 }
             }
-            else if(reverseInputData.Value == BitReversal.ByDoubleWord)
+            else if(inputReversal == BitReversal.ByDoubleWord)
             {
                 switch(bytesCount)
                 {

@@ -183,7 +183,7 @@ namespace Antmicro.Renode.Peripherals.SD
                 .WithFlag(10, out dBckEnd, FieldMode.Read, name: "Data block sent/received (DBCKEND)")
                 .WithFlag(11, FieldMode.Read, name: "Command transfer in progress (CMDACT)", valueProviderCallback: _ => false)
                 .WithTaggedFlag("Data transmit in progress (TXACT)", 12)
-                .WithTaggedFlag("Data receive in progress (RXACT)", 13)
+                .WithFlag(13, out rxAct, FieldMode.Read, name: "Data receive in progress (RXACT)")
                 .WithFlag(14, out txFifoHE, FieldMode.Read, name: "Transmit FIFO half empty: at least 8 words can be written into the FIFO (TXFIFOHE)")
                 .WithFlag(15, out rxFifoHF, FieldMode.Read, name: "Receive FIFO half full: there are at least 8 words in the FIFO (RXFIFOHF)")
                 .WithFlag(16, out txFifoF, FieldMode.Read, name: "Transmit FIFO full (TXFIFOF)")
@@ -191,7 +191,7 @@ namespace Antmicro.Renode.Peripherals.SD
                 .WithTaggedFlag("Transmit FIFO empty (TXFIFOE)", 18)
                 .WithFlag(19, out rxFifoE, FieldMode.Read, name: "Receive FIFO empty (RXFIFOE)")
                 .WithTaggedFlag("Data available in transmit FIFO (TXDAVL)", 20)
-                .WithTaggedFlag("Data available in receive FIFO (RXDAVL)", 21)
+                .WithFlag(21, FieldMode.Read, name: "Data available in receive FIFO (RXDAVL)", valueProviderCallback: _ => ReadDataBuffer.Count > 0)
                 .WithTaggedFlag("SDIO interrupt received (SDIOT)", 22)
                 .WithTaggedFlag("Boot acknowledgment received (boot acknowledgment check fail) (ACKFAIL)", 23)
                 .WithTaggedFlag("Boot acknowledgment timeout (ACKTIMEOUT)", 24)
@@ -278,6 +278,7 @@ namespace Antmicro.Renode.Peripherals.SD
             {
                 rxFifoHF.Value = false;
                 rxFifoE.Value = true;
+                rxAct.Value = false;
                 dataEnd.Value = true;
                 dBckEnd.Value = true;
                 UpdateInterrupts();
@@ -294,20 +295,15 @@ namespace Antmicro.Renode.Peripherals.SD
                 return;
             }
             WriteCard(sdCard, data);
-            WriteDataLeft -= 4;
+            writtenBytes += 4;
             this.DebugLog("Remaining data to write {0}", WriteDataLeft);
 
-            if(WriteDataLeft == 0)
-            {
-                txFifoHE.Value = false;
-                txFifoF.Value = true;
-                dataEnd.Value = true;
-                dBckEnd.Value = true;
-                UpdateInterrupts();
-            }
+            CheckWriteComplete();
         }
 
-        protected ulong WriteDataLeft { get; private set; }
+        // Counted up rather than down so that data reaching the FIFO before the transfer is armed
+        // still belongs to it; a plain countdown underflowed and the transfer never completed.
+        protected ulong WriteDataLeft => writeTarget > writtenBytes ? writeTarget - writtenBytes : 0;
 
         protected virtual bool TxFifoFEnableable { get => false; }
 
@@ -341,9 +337,29 @@ namespace Antmicro.Renode.Peripherals.SD
             {
                 this.WarningLog("Write transfer while DTDIR is clear");
             }
-            WriteDataLeft = ignoreBlockSize ? length : Math.Min(BlockSize, length);
+            writeTarget = ignoreBlockSize ? length : Math.Min(BlockSize, length);
             txFifoHE.Value = true;
             txFifoF.Value = false;
+            UpdateInterrupts();
+            // The FIFO may already hold the whole block: ST's HAL enables the DMA stream before
+            // it configures the DPSM, and a memory-to-peripheral stream pushes everything as soon
+            // as it is enabled, which is before this transfer gets armed. In that case the
+            // transfer is finished the moment its length becomes known.
+            CheckWriteComplete();
+        }
+
+        private void CheckWriteComplete()
+        {
+            if(writeTarget == 0 || writtenBytes < writeTarget)
+            {
+                return;
+            }
+            writeTarget = 0;
+            writtenBytes = 0;
+            txFifoHE.Value = false;
+            txFifoF.Value = true;
+            dataEnd.Value = true;
+            dBckEnd.Value = true;
             UpdateInterrupts();
         }
 
@@ -388,6 +404,17 @@ namespace Antmicro.Renode.Peripherals.SD
             case SDCardCommand.WriteSingleBlock_CMD24:
             case SDCardCommand.WriteMultipleBlocks_CMD25:
             case (SDCardCommand)SDCardAppCommand.SendSDConfigurationRegister_ACMD51:
+                // The DPSM asserts RXACT from the moment a card-to-host data command is issued
+                // until the block has been transferred. Since the data below is delivered only on
+                // the next synced state, a driver that polls RXACT to tell "still receiving" from
+                // "nothing is coming" would otherwise observe an idle DPSM in that window and give
+                // up. ST's F4 HAL does exactly that in SD_FindSCR, so ACMD51 returned a zeroed SCR
+                // and 4-bit bus configuration failed. DTDIR is already set up by the driver before
+                // the command is issued, which is how the real DPSM picks the direction too.
+                if(dataDirectionFromCard.Value)
+                {
+                    rxAct.Value = true;
+                }
                 // Need to delay the data so that firmware never consumes all data before reading the response
                 Machine.LocalTimeSource.ExecuteInNearestSyncedState(_ => ProcessDataCommand(sdCard, command));
                 break;
@@ -427,15 +454,20 @@ namespace Antmicro.Renode.Peripherals.SD
         {
             RegisteredPeripheral?.Reset();
             ReadDataBuffer.Clear();
-            WriteDataLeft = 0;
+            writeTarget = 0;
+            writtenBytes = 0;
             rxFifoE.Value = true;
             rxFifoHF.Value = false;
+            rxAct.Value = false;
             txFifoF.Value = true;
             txFifoHE.Value = false;
             UpdateInterrupts();
         }
 
         private uint BlockSize { get => 1u << (byte)blockSizeField.Value; }
+
+        private ulong writeTarget;
+        private ulong writtenBytes;
 
         private IValueRegisterField dataLength;
         private IValueRegisterField blockSizeField;
@@ -445,6 +477,7 @@ namespace Antmicro.Renode.Peripherals.SD
         private IFlagRegisterField txFifoF;
         private IFlagRegisterField rxFifoHF;
         private IFlagRegisterField rxFifoE;
+        private IFlagRegisterField rxAct;
         private IFlagRegisterField dataEnd;
         private IFlagRegisterField cmdSent;
         private IFlagRegisterField cmdREnd;

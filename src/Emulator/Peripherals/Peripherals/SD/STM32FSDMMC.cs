@@ -6,6 +6,7 @@
 //
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure.Registers;
+using Antmicro.Renode.Logging;
 
 namespace Antmicro.Renode.Peripherals.SD
 {
@@ -56,10 +57,25 @@ namespace Antmicro.Renode.Peripherals.SD
             {
                 return;
             }
-            /* DMA reads data from FIFO in bursts of 4 bytes when this pin blinks */
-            for(int i = 0; i < ReadDataBuffer.Count / DmaReadChunk; i++)
+            /* The SDMMC keeps requesting DMA service as long as the receive FIFO holds data.
+               How much the DMA drains per request is its own business: it depends on the
+               stream's FIFO/burst configuration, not on any fixed size here. Assuming 4 bytes
+               per request used to end this loop early whenever the DMA was set up with a
+               larger FIFO threshold - for a 512 byte block read with a full-FIFO threshold
+               only 416 bytes were delivered, NDTR never reached zero, and the transfer
+               complete interrupt never fired (ST's F4 HAL SD driver then timed out).
+               Request service until the FIFO is empty instead. */
+            while(ReadDataBuffer.Count > 0)
             {
+                var bytesLeftBefore = ReadDataBuffer.Count;
                 DMAReceive.Blink();
+                if(ReadDataBuffer.Count == bytesLeftBefore)
+                {
+                    /* The DMA is not consuming (stream disabled, or NDTR already exhausted).
+                       Give up rather than spin forever. */
+                    this.WarningLog("DMA did not drain the receive FIFO, {0} bytes left", bytesLeftBefore);
+                    break;
+                }
             }
         }
 
@@ -68,8 +84,6 @@ namespace Antmicro.Renode.Peripherals.SD
         protected override int CommandFieldsOffset { get => Stm32FCommandFieldsOffset; }
 
         private IFlagRegisterField dmaEnabled;
-
-        private const int DmaReadChunk = 4;
 
         private const int Stm32FClkDivWidth = 8;
         private const int Stm32FCommandFieldsOffset = 6;

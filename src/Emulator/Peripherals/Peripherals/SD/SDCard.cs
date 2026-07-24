@@ -10,10 +10,12 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 
+using Antmicro.Renode.Core;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.SPI;
 using Antmicro.Renode.Storage;
+using Antmicro.Renode.Time;
 using Antmicro.Renode.Utilities;
 
 using static Antmicro.Renode.Utilities.BitHelper;
@@ -36,9 +38,49 @@ namespace Antmicro.Renode.Peripherals.SD
         public SDCard(string imageFile, long capacity, bool persistent = false, bool spiMode = false, BlockLength blockSize = BlockLength.Undefined, CompressionType compression = CompressionType.None, bool emmc = false, string bootPartition0Image = null, string bootPartition1Image = null, long bootImageSize = 0)
             : this(DataStorage.CreateFromFile(imageFile, capacity, persistent, compression: compression), capacity, spiMode, blockSize, emmc, persistent, bootPartition0Image, bootPartition1Image, bootImageSize) { }
 
+        /* Card programming time. A real card does not finish a write when the last data byte is
+         * on the bus: it holds the host off (busy on DAT0, CURRENT_STATE = programming in the
+         * CMD13 response) while its controller programs the flash, and occasionally much longer
+         * when wear levelling or garbage collection kicks in. The model completed every write in
+         * zero virtual time, which makes any guest whose timing depends on those pauses -
+         * loggers sizing a RAM ring against the worst card stall, drivers with a busy timeout -
+         * impossible to exercise.
+         *
+         * All of these default to 0, which keeps the previous behaviour of an infinitely fast card.
+         */
+        public uint ProgrammingTimeMicroseconds { get; set; }
+
+        /* Programming is charged once per page, where a page is ProgrammingPageBytes wide. Real
+         * flash programs a whole page at once, so a 4 KB write is not eight times the cost of a
+         * 512 byte write - both dirty one page. Left at 0 (or 512) programming is charged per 512
+         * byte block as before, so an N block write costs N programming times; set it to the card's
+         * page size (e.g. 4096) to make writes up to one page flat and only multi-page writes
+         * scale. A write that touches a page at all pays for it, so a sub-page write still costs one
+         * whole page.
+         */
+        public uint ProgrammingPageBytes { get; set; }
+
+        // Extra busy time added once every StallEveryNthBlock programmed pages. Both must be
+        // non-zero for a stall to happen.
+        public uint StallTimeMicroseconds { get; set; }
+        public uint StallEveryNthBlock { get; set; }
+
+        /* Read latency. Unlike a write, a read has no card-side busy signal the host polls, so the
+         * controller (not the card) paces it: these are read from here by the SDMMC model when it
+         * completes a CMD17/CMD18 block read. A read costs an access latency plus the bus transfer
+         * time for the bytes moved. Both default to 0, leaving reads completing in zero virtual
+         * time as before.
+         */
+        public uint ReadAccessTimeMicroseconds { get; set; }
+        public uint ReadTransferTimeMicrosecondsPer512 { get; set; }
+
         public void Reset()
         {
             GoToIdle();
+
+            busyUntil = TimeInterval.Empty;
+            lastProgrammedPage = -1;
+            blocksProgrammed = 0;
 
             var sdCapacityParameters = SDHelpers.SeekForCapacityParameters(capacity, blockSize);
             blockLengthInBytes = SDHelpers.BlockLengthInBytes(sdCapacityParameters.BlockSize);
@@ -333,8 +375,8 @@ namespace Antmicro.Renode.Peripherals.SD
                 .DefineFragment(5, 1, () => (TreatNextCommandAsAppCommand ? 1 : 0u), name: "APP_CMD bit")
                 // SWITCH_ERROR: JESD84-B51 Table 68, set on a bad CMD6 SWITCH
                 .DefineFragment(7, 1, () => (switchError ? 1u : 0u), name: "SWITCH_ERROR bit")
-                .DefineFragment(8, 1, 1, name: "READY_FOR_DATA bit")
-                .DefineFragment(9, 4, () => (uint)state, name: "CURRENT_STATE")
+                .DefineFragment(8, 1, () => (IsProgramming ? 0u : 1u), name: "READY_FOR_DATA bit")
+                .DefineFragment(9, 4, () => (uint)EffectiveState, name: "CURRENT_STATE")
             ;
 
             operatingConditionsGenerator = new VariableLengthValue(32)
@@ -752,6 +794,9 @@ namespace Antmicro.Renode.Peripherals.SD
                 writeContext.Offset = highCapacityMode
                     ? arg * HighCapacityBlockLength
                     : arg;
+                // Each write command reprograms the pages it touches, so start counting this
+                // command's pages from the one before its target (see AccountProgrammingTime).
+                lastProgrammedPage = ((long)writeContext.Offset / ProgrammingPageLength) - 1;
                 return spiMode
                     ? GenerateR1Response()
                     : CardStatus;
@@ -764,6 +809,9 @@ namespace Antmicro.Renode.Peripherals.SD
                 writeContext.Offset = highCapacityMode
                     ? arg * HighCapacityBlockLength
                     : arg;
+                // Each write command reprograms the pages it touches, so start counting this
+                // command's pages from the one before its target (see AccountProgrammingTime).
+                lastProgrammedPage = ((long)writeContext.Offset / ProgrammingPageLength) - 1;
                 return spiMode
                     ? GenerateR1Response()
                     : CardStatus;
@@ -957,6 +1005,75 @@ namespace Antmicro.Renode.Peripherals.SD
             WriteDataToUnderlyingFile(writeContext.Offset, length, data);
             writeContext.Move((uint)length);
             state = SDCardState.Transfer;
+            AccountProgrammingTime(length);
+        }
+
+        /* Controllers hand write data over in bus-sized pieces (the STM32 SDMMC FIFO is fed a word
+         * at a time), so this runs many times per block. Programming is charged per page touched:
+         * lastProgrammedPage is the highest page already charged for the current write command (reset
+         * to the page before the target when CMD24/CMD25 arrives), and each new page the write
+         * advances into costs one programming time. At the default page length of 512 that is one
+         * charge per 512 byte block, exactly as before.
+         *
+         * Charging per page (rather than per blockLengthInBytes) matters because on a standard
+         * capacity card blockLengthInBytes is whatever READ_BL_LEN the CSD needed to encode the size
+         * (up to 2 KB), a capacity artifact rather than the unit the card programs.
+         */
+        private void AccountProgrammingTime(int length)
+        {
+            if(ProgrammingTimeMicroseconds == 0 && StallTimeMicroseconds == 0)
+            {
+                return;
+            }
+
+            // Offset has already advanced past this chunk; the last byte written sits at Offset - 1.
+            // Cast before subtracting so a zero offset does not underflow the unsigned field.
+            var endPage = ((long)writeContext.Offset - 1) / ProgrammingPageLength;
+            while(lastProgrammedPage < endPage)
+            {
+                lastProgrammedPage++;
+                blocksProgrammed++;
+
+                var busy = ProgrammingTimeMicroseconds;
+                if(StallEveryNthBlock != 0 && StallTimeMicroseconds != 0 && (blocksProgrammed % StallEveryNthBlock) == 0)
+                {
+                    busy += StallTimeMicroseconds;
+                    this.Log(LogLevel.Debug, "Stalling for {0}us after {1} programmed pages", StallTimeMicroseconds, blocksProgrammed);
+                }
+
+                /* A burst the model transfers in zero virtual time still has to program every page
+                 * it dirtied, so the windows are queued end to end instead of overlapping.
+                 */
+                var now = CurrentTime;
+                busyUntil = (busyUntil > now ? busyUntil : now) + TimeInterval.FromMicroseconds(busy);
+                this.Log(LogLevel.Noisy, "Page {0} programmed: now {1}us, busy until {2}us", blocksProgrammed, now.TotalMicroseconds, busyUntil.TotalMicroseconds);
+            }
+        }
+
+        // Default (0) means charge per 512 byte block, matching the earlier per-block behaviour.
+        private uint ProgrammingPageLength => ProgrammingPageBytes == 0 ? ProgrammingBlockLength : ProgrammingPageBytes;
+
+        private bool IsProgramming => busyUntil > CurrentTime;
+
+        /* Only a card idling in transfer is reported busy. Overriding the state mid-read would
+         * break a transfer that is legitimately in progress, and only writes extend busyUntil.
+         */
+        private SDCardState EffectiveState => (state == SDCardState.Transfer && IsProgramming)
+            ? SDCardState.Programming
+            : state;
+
+        private TimeInterval CurrentTime
+        {
+            get
+            {
+                if(cachedMachine == null && !this.TryGetMachine(out cachedMachine))
+                {
+                    // Not registered in a machine (unit tests, construction time): no virtual
+                    // time to charge the programming against.
+                    return TimeInterval.Empty;
+                }
+                return cachedMachine.ElapsedVirtualTime.TimeElapsed;
+            }
         }
 
         /* Data packet has the following format:
@@ -1045,6 +1162,11 @@ namespace Antmicro.Renode.Peripherals.SD
 
         private SDCardState state;
 
+        private TimeInterval busyUntil;
+        private long lastProgrammedPage;
+        private ulong blocksProgrammed;
+        private IMachine cachedMachine;
+
         private uint blockLengthInBytes;
         private IoContext writeContext;
         private IoContext readContext;
@@ -1071,6 +1193,7 @@ namespace Antmicro.Renode.Peripherals.SD
         private const byte DummyByte = 0xFF;
         private const byte BlockBeginIndicator = 0xFE;
         private const int HighCapacityBlockLength = 512;
+        private const uint ProgrammingBlockLength = 512;
         private const byte DataAcceptedResponse = 0x05;
         private const int EmmcExtendedCsdLength = 512;
         private const int EmmcSizeMultUnit = 128 * 1024; // BOOT_SIZE_MULT / RPMB_SIZE_MULT unit

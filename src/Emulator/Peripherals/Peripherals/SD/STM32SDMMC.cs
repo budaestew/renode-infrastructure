@@ -12,6 +12,7 @@ using Antmicro.Renode.Core.Structure;
 using Antmicro.Renode.Core.Structure.Registers;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Time;
 using Antmicro.Renode.Utilities;
 
 using SDCardAppCommand = Antmicro.Renode.Peripherals.SD.SDCard.SdCardApplicationSpecificCommand;
@@ -368,10 +369,11 @@ namespace Antmicro.Renode.Peripherals.SD
             switch(command)
             {
             case SDCardCommand.ReadSingleBlock_CMD17:
-                ProcessRead(sdCard);
+                ScheduleBlockRead(BlockSize, () => ProcessRead(sdCard));
                 break;
             case SDCardCommand.ReadMultipleBlocks_CMD18:
-                ProcessRead(sdCard, (uint)dataLength.Value, true);
+                var length = (uint)dataLength.Value;
+                ScheduleBlockRead(length, () => ProcessRead(sdCard, length, true));
                 break;
             case SDCardCommand.WriteSingleBlock_CMD24:
                 ProcessWrite();
@@ -386,6 +388,33 @@ namespace Antmicro.Renode.Peripherals.SD
                 ProcessRead(sdCard, 8);
                 break;
             }
+        }
+
+        /* A write's programming busy is a card-side signal the host polls (CMD13); a read has none,
+         * so read latency has to be paced by the controller. The card carries the timing knobs
+         * (ReadAccessTimeMicroseconds + ReadTransferTimeMicrosecondsPer512 per 512 bytes moved). For
+         * a CMD17/CMD18 block read the data itself is held back that long - not just DATAEND - so
+         * that whichever completion the host waits on (DMA transfer-complete or DATAEND) is delayed
+         * and a size-proportional read time becomes observable. Register reads (ACMD13/ACMD51) stay
+         * immediate: they are tiny and deferring them would disturb the RXACT init polling. RXACT is
+         * already asserted (in ProcessCommand) before we get here, so a host polling it during the
+         * delay still sees "receiving". */
+        private void ScheduleBlockRead(uint bytes, Action doRead)
+        {
+            var card = RegisteredPeripheral;
+            var micros = 0UL;
+            if(card != null)
+            {
+                var blocks = (bytes + 511) / 512;
+                micros = (ulong)card.ReadAccessTimeMicroseconds
+                    + (ulong)card.ReadTransferTimeMicrosecondsPer512 * blocks;
+            }
+            if(micros == 0)
+            {
+                doRead();
+                return;
+            }
+            Machine.ScheduleAction(TimeInterval.FromMicroseconds(micros), _ => doRead());
         }
 
         private void ProcessCommand(SDCard sdCard, SDCardCommand command, bool wasAppCommand)

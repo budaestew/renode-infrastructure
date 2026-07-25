@@ -67,7 +67,18 @@ namespace Antmicro.Renode.Core.CAN
             DebugHelper.Assert(!extendedFormat || extendedIdPart < (1 << StandardIdOffset));
         }
 
-        public CANMessageFrame(uint id, byte[] data, bool extendedFormat = false, bool remoteFrame = false, bool fdFormat = false, bool bitRateSwitch = false)
+        // An error frame carries no identifier or payload on a real bus - it is six dominant
+        // bits and a delimiter, sent by whichever node detected the violation, and it destroys
+        // the frame that was in flight. Modelling it as a marked CANMessageFrame lets it travel
+        // the existing hub without every peripheral having to learn a second delivery path.
+        // errorCode is a controller-independent hint at what was detected; STM32 bxCAN maps it
+        // straight onto CAN_ESR.LEC.
+        public static CANMessageFrame CreateErrorFrame(byte errorCode)
+        {
+            return new CANMessageFrame(0, new byte[] { errorCode }, errorFrame: true);
+        }
+
+        public CANMessageFrame(uint id, byte[] data, bool extendedFormat = false, bool remoteFrame = false, bool fdFormat = false, bool bitRateSwitch = false, bool errorFrame = false)
         {
             // id := standard[10:0]                     if !extendedFormat
             //       standard[28:18] + extended[17:0]   otherwise
@@ -78,10 +89,15 @@ namespace Antmicro.Renode.Core.CAN
             RemoteFrame = remoteFrame;
             FDFormat = fdFormat;
             BitRateSwitch = bitRateSwitch;
+            ErrorFrame = errorFrame;
         }
 
         public override string ToString()
         {
+            if(ErrorFrame)
+            {
+                return $"[ErrorFrame: Code={(Data.Length > 0 ? Data[0] : 0)}]";
+            }
             return $"[Message: Data={DataAsHex}, Remote={RemoteFrame}, Extended={ExtendedFormat}, BitRateSwitch={BitRateSwitch}, FDFormat={FDFormat}, Id={Id}, DataLength={Data.Length}]";
         }
 
@@ -110,6 +126,12 @@ namespace Antmicro.Renode.Core.CAN
         public byte[] Data { get; }
 
         public bool ExtendedFormat { get; }
+
+        // True for a bus error signalled by another node rather than a data frame. Receivers
+        // must not deliver it to a mailbox; it is an error report, not traffic.
+        // ToSocketCAN does not encode this - the SocketCAN bridge has no error-frame path here,
+        // so such a frame leaves the emulation as an ordinary id 0 frame.
+        public bool ErrorFrame { get; }
 
         public bool RemoteFrame { get; }
 

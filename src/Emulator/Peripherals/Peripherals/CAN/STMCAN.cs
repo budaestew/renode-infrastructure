@@ -85,6 +85,16 @@ namespace Antmicro.Renode.Peripherals.CAN
 
         public void OnFrameReceived(CANMessageFrame message)
         {
+            // A bus error signalled by another node. It is not traffic, so it never reaches a
+            // mailbox - it only moves the error state. Silent mode does not exempt the
+            // controller here: a listening node still detects violations and still counts them,
+            // it just does not transmit an error flag of its own.
+            if(message.ErrorFrame)
+            {
+                InjectError(message.Data.Length > 0 ? message.Data[0] : LECDefaultErrorCode);
+                return;
+            }
+
             if(registers.CAN_MCR.SleepRequest == true)
             {
                 // Wake up if autowake up is on
@@ -321,30 +331,9 @@ namespace Antmicro.Renode.Peripherals.CAN
             {
                 return true;
             }
-            // Error warning interrupt
-            if(registers.CAN_IER.EWGInterruptEnabled == true &&
-                registers.CAN_ESR.ErrorWarningFlag == true)
-            {
-                return true;
-            }
-            // Error passive interrupt
-            if(registers.CAN_IER.EPVInterruptEnabled == true &&
-                registers.CAN_ESR.ErrorPassiveFlag == true)
-            {
-                return true;
-            }
-            // Error passive interrupt
-            if(registers.CAN_IER.BOFInterruptEnabled == true &&
-                registers.CAN_ESR.BusOffFlag == true)
-            {
-                return true;
-            }
-            // LEC Error pending
-            if(registers.CAN_IER.LECInterruptEnabled == true &&
-                registers.CAN_ESR.LECErrorPending() == true)
-            {
-                return true;
-            }
+            // The error conditions themselves are not tested here. Per the RM they set
+            // MSR.ERRI on detection, and the line is driven by ERRI alone - see
+            // SignalErrorDetected.
             //  Sleep interrupt
             if(registers.CAN_IER.SLKInterruptEnabled == true &&
                 registers.CAN_MSR.SleepAckInterrupt == true)
@@ -416,6 +405,24 @@ namespace Antmicro.Renode.Peripherals.CAN
             return false;
         }
 
+        // An error was detected. Per the RM the enable bits decide whether a condition latches
+        // MSR.ERRI, and the interrupt line then follows ERRI, which software clears by writing 1.
+        // Driving the line straight from the CAN_ESR flags instead makes it a level: bus-off
+        // holds until the recovery sequence completes, so a handler that clears ERRI and returns
+        // is re-entered immediately and no task ever runs again. That livelock is invisible until
+        // something actually sets the flags.
+        private void SignalErrorDetected()
+        {
+            if((registers.CAN_IER.EWGInterruptEnabled && registers.CAN_ESR.ErrorWarningFlag) ||
+               (registers.CAN_IER.EPVInterruptEnabled && registers.CAN_ESR.ErrorPassiveFlag) ||
+               (registers.CAN_IER.BOFInterruptEnabled && registers.CAN_ESR.BusOffFlag) ||
+               (registers.CAN_IER.LECInterruptEnabled && registers.CAN_ESR.LECErrorPending()))
+            {
+                registers.CAN_MSR.ErrorInterrupt = true;
+            }
+            UpdateSCEInterruptLine();
+        }
+
         public void UpdateSCEInterruptLine()
         {
             // Error and status change interrupt
@@ -428,6 +435,79 @@ namespace Antmicro.Renode.Peripherals.CAN
                 Connections[CAN_SCE].Unset();
             }
         }
+
+        // Report one detected protocol error, as if the controller had flagged it and sent an
+        // active error flag. lec is a CAN_ESR LEC code: 1 stuff, 2 form, 3 ack, 4 bit recessive,
+        // 5 bit dominant, 6 CRC.
+        //
+        // There is no bit level modelling here - frames cross the hub as structs, so no frame
+        // can actually be malformed and no error frame exists on the wire. What this does model
+        // is everything the guest can observe: the last error code, the counter arithmetic from
+        // ISO 11898-1 (a receiver adds 1 to REC, a transmitter adds 8 to TEC), the derived
+        // status flags, and the SCE interrupt. Repeating it walks the peripheral into error
+        // warning, error passive and finally bus-off the same way a degrading line would.
+        //
+        // What it cannot do is destroy the frame that was being carried. A real error frame
+        // aborts the transmission and the receivers lose it; here the frame still arrives. So
+        // an injected storm reproduces the guest's reaction to a bad line, not the data loss
+        // that comes with it.
+        public void InjectError(uint lec, bool transmitter = false)
+        {
+            if(lec < 1 || lec > 6)
+            {
+                throw new RecoverableException("lec must be a CAN_ESR error code in 1..6");
+            }
+            registers.CAN_ESR.LastErrorCode = lec;
+            if(transmitter)
+            {
+                TransmitErrorCounter = registers.CAN_ESR.TransmitErrorCounter + TransmitErrorIncrement;
+            }
+            else
+            {
+                ReceiveErrorCounter = registers.CAN_ESR.ReceiveErrorCounter + ReceiveErrorIncrement;
+            }
+        }
+
+        // Error counter injection for tests that need a specific severity without walking there
+        // one error at a time - bus-off is 256 receive errors away. Writing them derives
+        // EWGF/EPVF/BOFF and refreshes the SCE line.
+        // Setting TransmitErrorCounter above 255 is what puts the peripheral in bus-off; the
+        // register field then reads the truncated value, matching a real controller whose TEC
+        // no longer reflects the pre-overflow count.
+        // Both saturate. A real controller's counters do not run away - REC is capped while the
+        // node is error passive, and TEC stops mattering once it overflows into bus-off. Letting
+        // them grow past the 8 bit register field would make GetValue wrap, so a sustained storm
+        // would report a counter that keeps falling back to small values.
+        public uint TransmitErrorCounter
+        {
+            get { return registers.CAN_ESR.TransmitErrorCounter; }
+            set
+            {
+                registers.CAN_ESR.TransmitErrorCounter = Math.Min(value, BusOffCounterCeiling);
+                SignalErrorDetected();
+            }
+        }
+
+        public uint ReceiveErrorCounter
+        {
+            get { return registers.CAN_ESR.ReceiveErrorCounter; }
+            set
+            {
+                registers.CAN_ESR.ReceiveErrorCounter = Math.Min(value, DeviceRegisters.ErrorStatusRegister.RECMASK);
+                SignalErrorDetected();
+            }
+        }
+
+        // ISO 11898-1 fault confinement: a receiver that detects an error adds 1 to REC, a
+        // transmitter adds 8 to TEC. The asymmetry is deliberate in the standard - it makes a
+        // node that is itself faulty back off far sooner than the nodes listening to it.
+        private const uint ReceiveErrorIncrement = 1;
+        private const uint TransmitErrorIncrement = 8;
+        // One past the bus-off threshold. Enough to latch BOFF, low enough to stay representable.
+        private const uint BusOffCounterCeiling = 256;
+        // Used when an error frame arrives without a code. Bit dominant is what a receiver most
+        // often latches when another node overwrites the bus with an error flag.
+        private const uint LECDefaultErrorCode = 5;
 
         public void UpdateFifo0InterruptLine()
         {
@@ -522,7 +602,7 @@ namespace Antmicro.Renode.Peripherals.CAN
                 else
                 {
                     registers.CAN_ESR.SetLECBitDominantError();
-                    UpdateSCEInterruptLine();
+                    SignalErrorDetected();
                 }
             }
             if(registers.CAN_BTR.LoopbackMode == true)
@@ -1544,19 +1624,18 @@ namespace Antmicro.Renode.Peripherals.CAN
             {
                 public void SetResetValue(uint value)
                 {
-                    ErrorWarningFlag = (value & EWGF) != 0;
-                    ErrorPassiveFlag = (value & EPVF) != 0;
-                    BusOffFlag = (value & BOFF) != 0;
                     LastErrorCode = (value >> LECSHIFT) & LECMASK;
                     TransmitErrorCounter = (value >> TECSHIFT) & TECMASK;
                     ReceiveErrorCounter = (value >> RECSHIFT) & RECMASK;
                 }
 
+                // Guest write. Per the RM only LEC is writable - software marks it 0b111 to
+                // check the interrupt path. The error counters and the EWGF/EPVF/BOFF flags
+                // are read-only status. Previously every field was taken from the written
+                // value, so a guest clearing LEC also zeroed TEC and REC.
                 public void SetValue(uint value)
                 {
                     LastErrorCode = (value >> LECSHIFT) & LECMASK;
-                    TransmitErrorCounter = (value >> TECSHIFT) & TECMASK;
-                    ReceiveErrorCounter = (value >> RECSHIFT) & RECMASK;
                 }
 
                 public uint GetValue()
@@ -1581,9 +1660,18 @@ namespace Antmicro.Renode.Peripherals.CAN
                     return (LastErrorCode > LECNoError) && (LastErrorCode < LECSetBySoftware);
                 }
 
-                public bool ErrorWarningFlag;
-                public bool ErrorPassiveFlag;
-                public bool BusOffFlag;
+                // These three are not independent bits: the RM defines them as a function of
+                // the error counters. Nothing ever assigned them, so they read 0 forever and
+                // guest code that branches on error warning, error passive or bus-off could
+                // not be exercised at all.
+                // BOFF is entered on TEC overflow past 255. The register field is 8 bits, so
+                // the counter is kept unmasked here and only GetValue truncates it - that is
+                // what makes the overflow representable.
+                public bool ErrorWarningFlag => TransmitErrorCounter >= ErrorWarningLimit ||
+                                                ReceiveErrorCounter >= ErrorWarningLimit;
+                public bool ErrorPassiveFlag => TransmitErrorCounter >= ErrorPassiveLimit ||
+                                                ReceiveErrorCounter >= ErrorPassiveLimit;
+                public bool BusOffFlag => TransmitErrorCounter > BusOffLimit;
 
                 public uint LastErrorCode;
                 public uint TransmitErrorCounter;
@@ -1598,6 +1686,10 @@ namespace Antmicro.Renode.Peripherals.CAN
                 public const uint TECMASK = 0xFF;
                 public const int RECSHIFT = 24;
                 public const uint RECMASK = 0xFF;
+
+                public const uint ErrorWarningLimit = 96;
+                public const uint ErrorPassiveLimit = 128;
+                public const uint BusOffLimit = 255;
 
                 public const uint LECNoError = 0x0;
                 public const uint LECBitDominantError = 0x5;

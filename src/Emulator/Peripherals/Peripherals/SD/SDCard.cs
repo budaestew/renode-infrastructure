@@ -82,6 +82,15 @@ namespace Antmicro.Renode.Peripherals.SD
          */
         public bool OpCondStuckBusy { get; set; }
 
+        /* Failure-mode knob: a card that answers ACMD51 (SEND_SCR) with a normal R1 but never
+         * drives the data line, so the 8 SCR bytes never arrive. This is the 2026-07 field failure
+         * on 26 units: card identification (CMD0/CMD8, ACMD41, CID/RCA/CSD) all pass because those
+         * live on the CMD line, and the first thing that needs a data transfer - the SCR read
+         * inside the 1-bit to 4-bit switch - gets nothing. A host that polls that read without a
+         * bound spins until its watchdog fires. Identification stays healthy while this is set.
+         */
+        public bool ScrDataStall { get; set; }
+
         public void Reset()
         {
             GoToIdle();
@@ -89,6 +98,7 @@ namespace Antmicro.Renode.Peripherals.SD
             busyUntil = TimeInterval.Empty;
             lastProgrammedPage = -1;
             blocksProgrammed = 0;
+            scrStalled = false;
 
             var sdCapacityParameters = SDHelpers.SeekForCapacityParameters(capacity, blockSize);
             blockLengthInBytes = SDHelpers.BlockLengthInBytes(sdCapacityParameters.BlockSize);
@@ -266,6 +276,16 @@ namespace Antmicro.Renode.Peripherals.SD
         public byte[] ReadData(uint size)
         {
             byte[] result;
+
+            if(scrStalled)
+            {
+                // ScrDataStall: the ACMD51 response was already sent, but no data follows. Returning
+                // an empty array leaves the controller's read FIFO empty, so the host sees neither
+                // RXDAVL nor a completion flag - the stalled data line, as observed in the field.
+                scrStalled = false;
+                this.Log(LogLevel.Warning, "ScrDataStall: withholding SCR data after ACMD51");
+                return new byte[0];
+            }
 
             if(sendingExtendedCsd)
             {
@@ -543,6 +563,15 @@ namespace Antmicro.Renode.Peripherals.SD
                 return true;
 
             case SdCardApplicationSpecificCommand.SendSDConfigurationRegister_ACMD51:
+                if(ScrDataStall)
+                {
+                    // Answer the command, then withhold the data (consumed by ReadData). The card
+                    // stays in Transfer so later CMD13 polls and CMD17 reads still work - that is
+                    // what makes the SCR read specifically, rather than the card, the broken part.
+                    scrStalled = true;
+                    result = CardStatus;
+                    return true;
+                }
                 readContext.Data = SDConfiguration;
                 state = SDCardState.SendingData;
                 result = spiMode
@@ -1165,6 +1194,7 @@ namespace Antmicro.Renode.Peripherals.SD
         private int emmcExtendedCsdOffset;
 
         private bool sendingExtendedCsd;
+        private bool scrStalled; // ScrDataStall: ACMD51 answered, its data still owed and never paid
         private bool switchError;
         private EmmcPartition activePartition;
 

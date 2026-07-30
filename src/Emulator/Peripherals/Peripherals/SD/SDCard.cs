@@ -74,6 +74,14 @@ namespace Antmicro.Renode.Peripherals.SD
         public uint ReadAccessTimeMicroseconds { get; set; }
         public uint ReadTransferTimeMicrosecondsPer512 { get; set; }
 
+        /* Failure-mode knob: a degraded card that answers CMD0/CMD8/CMD55 normally but never
+         * finishes power-up. While set, the ACMD41 (SD_SEND_OP_COND) response keeps the OCR
+         * power-up status bit (31) at 0 and the card never leaves Idle, so a spec-following
+         * host polls ACMD41 until its retry budget runs out. Models the field failure where
+         * hosts with an unbounded/oversized retry loop spin far past their watchdog deadline.
+         */
+        public bool OpCondStuckBusy { get; set; }
+
         public void Reset()
         {
             GoToIdle();
@@ -398,7 +406,7 @@ namespace Antmicro.Renode.Peripherals.SD
                 .DefineFragment(22, 1, 1, name: "VDD voltage window 3.4 - 3.5")
                 .DefineFragment(23, 1, 1, name: "VDD voltage window 3.5 - 3.6")
                 .DefineFragment(30, 1, () => this.highCapacityMode ? 1 : 0u, name: "Card Capacity Status")
-                .DefineFragment(31, 1, 1, name: "Card power up status bit (busy)")
+                .DefineFragment(31, 1, () => this.OpCondStuckBusy ? 0 : 1u, name: "Card power up status bit (busy)")
             ;
 
             if(!highCapacityMode)
@@ -523,7 +531,7 @@ namespace Antmicro.Renode.Peripherals.SD
             case SdCardApplicationSpecificCommand.SendOperatingConditionRegister_ACMD41:
                 // If HCS is set to 0, High Capacity SD Memory Card never returns ready state
                 var hcs = BitHelper.IsBitSet(arg, 30);
-                if(!highCapacityMode || hcs)
+                if((!highCapacityMode || hcs) && !OpCondStuckBusy)
                 {
                     // activate the card
                     state = SDCardState.Ready;

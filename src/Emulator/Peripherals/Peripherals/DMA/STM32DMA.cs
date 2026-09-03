@@ -238,6 +238,17 @@ namespace Antmicro.Renode.Peripherals.DMA
 
             private void HandleEnable(bool value)
             {
+                if(value)
+                {
+                    // Enabling the stream restarts the transfer at M0A on hardware: the
+                    // internal pointer is (re)loaded when EN goes 0 -> 1. Without this the
+                    // offset survives a disable/re-arm, so a driver that re-initialises a
+                    // circular RX ring mid-ring (write NDTR, set EN) has the DMA writing at
+                    // the stale offset while it derives head from NDTR. The ring is then
+                    // permanently desynchronised and the driver replays old ring content.
+                    dataOffset = 0;
+                }
+
                 // Only transfers from peripheral are using interrupt driven approach.
                 // In other cases we can just transfer all data immediately.
                 if(value && direction.Value != Direction.PeripheralToMemory)

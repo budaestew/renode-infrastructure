@@ -333,8 +333,13 @@ namespace Antmicro.Renode.Peripherals.SD
                 this.WarningLog("Read transfer while DTDIR is set");
             }
             ReadCard(sdCard, ignoreBlockSize ? length : Math.Min(BlockSize, length));
-            rxFifoHF.Value = true;
-            rxFifoE.Value = false;
+            // A DMA-driven ReadCard may already have drained the FIFO and completed the transfer;
+            // raising the flags unconditionally would leave a stale RXFIFOHF on an empty FIFO
+            if(ReadDataBuffer.Count > 0)
+            {
+                rxFifoHF.Value = true;
+                rxFifoE.Value = false;
+            }
             UpdateInterrupts();
         }
 

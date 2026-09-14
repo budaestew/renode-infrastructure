@@ -29,6 +29,7 @@ namespace Antmicro.Renode.Peripherals.DMA
             engine = new DmaEngine(machine.GetSystemBus(this));
 
             transferCompleteIrqStatus = new IFlagRegisterField[NrOfStreams];
+            halfTransferIrqStatus = new IFlagRegisterField[NrOfStreams];
 
             DefineRegisters();
             Reset();
@@ -85,7 +86,7 @@ namespace Antmicro.Renode.Peripherals.DMA
                     .WithReservedBits(offset + 1, 1)
                     .WithTaggedFlag($"DMEIF{lowStreamIdx}", offset + 2)
                     .WithTaggedFlag($"TEIF{lowStreamIdx}", offset + 3)
-                    .WithTaggedFlag($"HTIF{lowStreamIdx}", offset + 4)
+                    .WithFlag(offset + 4, out halfTransferIrqStatus[lowStreamIdx], FieldMode.Read, name: $"HTIF{lowStreamIdx}")
                     .WithFlag(offset + 5, out transferCompleteIrqStatus[lowStreamIdx], FieldMode.Read, name: $"TCIF{lowStreamIdx}");
 
                 highInterruptStatusReg
@@ -93,7 +94,7 @@ namespace Antmicro.Renode.Peripherals.DMA
                     .WithReservedBits(offset + 1, 1)
                     .WithTaggedFlag($"DMEIF{highStreamIdx}", offset + 2)
                     .WithTaggedFlag($"TEIF{highStreamIdx}", offset + 3)
-                    .WithTaggedFlag($"HTIF{highStreamIdx}", offset + 4)
+                    .WithFlag(offset + 4, out halfTransferIrqStatus[highStreamIdx], FieldMode.Read, name: $"HTIF{highStreamIdx}")
                     .WithFlag(offset + 5, out transferCompleteIrqStatus[highStreamIdx], FieldMode.Read, name: $"TCIF{highStreamIdx}");
 
                 lowInterruptClearReg
@@ -101,7 +102,8 @@ namespace Antmicro.Renode.Peripherals.DMA
                     .WithReservedBits(offset + 1, 1)
                     .WithTaggedFlag($"CDMEIF{lowStreamIdx}", offset + 2)
                     .WithTaggedFlag($"CTEIF{lowStreamIdx}", offset + 3)
-                    .WithTaggedFlag($"CHTIF{lowStreamIdx}", offset + 4)
+                    .WithFlag(offset + 4, FieldMode.Set, name: $"CHTIF{lowStreamIdx}",
+                        writeCallback: (_, value) => ClearIrqFlagOnCondition(halfTransferIrqStatus[lowStreamIdx], value))
                     .WithFlag(offset + 5, FieldMode.Set, name: $"CTCIF{lowStreamIdx}",
                         writeCallback: (_, value) => ClearIrqFlagOnCondition(transferCompleteIrqStatus[lowStreamIdx], value));
 
@@ -110,7 +112,8 @@ namespace Antmicro.Renode.Peripherals.DMA
                     .WithReservedBits(offset + 1, 1)
                     .WithTaggedFlag($"CDMEIF{highStreamIdx}", offset + 2)
                     .WithTaggedFlag($"CTEIF{highStreamIdx}", offset + 3)
-                    .WithTaggedFlag($"CHTIF{highStreamIdx}", offset + 4)
+                    .WithFlag(offset + 4, FieldMode.Set, name: $"CHTIF{highStreamIdx}",
+                        writeCallback: (_, value) => ClearIrqFlagOnCondition(halfTransferIrqStatus[highStreamIdx], value))
                     .WithFlag(offset + 5, FieldMode.Set, name: $"CTCIF{highStreamIdx}",
                         writeCallback: (_, value) => ClearIrqFlagOnCondition(transferCompleteIrqStatus[highStreamIdx], value));
             }
@@ -130,13 +133,15 @@ namespace Antmicro.Renode.Peripherals.DMA
             for(var streamId = 0; streamId < NrOfStreams; streamId++)
             {
                 var stream = streams[streamId];
-                var irqValue = stream.TransferCompleteIrqEnable && transferCompleteIrqStatus[streamId].Value;
+                var irqValue = (stream.TransferCompleteIrqEnable && transferCompleteIrqStatus[streamId].Value)
+                    || (stream.HalfTransferIrqEnable && halfTransferIrqStatus[streamId].Value);
                 this.NoisyLog("IRQ {0} set to {1}", streamId, irqValue);
                 stream.IRQ.Set(irqValue);
             }
         }
 
         private readonly IFlagRegisterField[] transferCompleteIrqStatus;
+        private readonly IFlagRegisterField[] halfTransferIrqStatus;
 
         private readonly DmaEngine engine;
         private readonly Stream[] streams;
@@ -187,6 +192,8 @@ namespace Antmicro.Renode.Peripherals.DMA
 
             public bool TransferCompleteIrqEnable => transferCompleteIrqEnable.Value;
 
+            public bool HalfTransferIrqEnable => halfTransferIrqEnable.Value;
+
             private void DefineRegisters()
             {
                 var streamOffset = id * StreamStep;
@@ -195,7 +202,7 @@ namespace Antmicro.Renode.Peripherals.DMA
                     .WithFlag(0, out isEnabled, name: "EN", writeCallback: (_, value) => HandleEnable(value))
                     .WithTaggedFlag("DMEIE", 1)
                     .WithTaggedFlag("TEIE", 2)
-                    .WithTaggedFlag("HTIE", 3)
+                    .WithFlag(3, out halfTransferIrqEnable, name: "HTIE")
                     .WithFlag(4, out transferCompleteIrqEnable, name: "TCIE")
                     .WithTaggedFlag("PFCTRL", 5)
                     .WithEnumField(6, 2, out direction, name: "DIR")
@@ -265,9 +272,20 @@ namespace Antmicro.Renode.Peripherals.DMA
                         PeripheralDataSizeInBytes : MemoryDataSizeInBytes;
                     var nrOfDataUnits = request.Size / dataUnitSize;
 
+                    var remainingBefore = nrOfData.Value;
                     nrOfData.Value -= (ulong)nrOfDataUnits;
                     dataOffset += (ulong)request.Size;
                     parent.engine.IssueCopy(request);
+
+                    // HTIF is set when half of the transfer is done, on every cycle in circular mode.
+                    // A circular RX ring pumped only at TC and IDLE cannot tell an empty ring from a
+                    // full wrap, so drivers rely on HT to see a continuous stream longer than the ring.
+                    var half = initialNrOfData / 2;
+                    if(remainingBefore > half && nrOfData.Value <= half)
+                    {
+                        parent.halfTransferIrqStatus[id].Value = true;
+                        parent.UpdateInterrupts();
+                    }
 
                     if(nrOfData.Value == 0)
                     {
@@ -387,6 +405,7 @@ namespace Antmicro.Renode.Peripherals.DMA
             private IFlagRegisterField circularMode;
             private ulong initialNrOfData;
             private IFlagRegisterField transferCompleteIrqEnable;
+            private IFlagRegisterField halfTransferIrqEnable;
             private IEnumRegisterField<Direction> direction;
             private IFlagRegisterField peripheralIncrementOffset;
             private IFlagRegisterField memoryIncrementOffset;

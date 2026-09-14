@@ -455,8 +455,14 @@ namespace Antmicro.Renode.Peripherals.SD
                 {
                     rxActive = true;
                 }
-                // Need to delay the data so that firmware never consumes all data before reading the response
-                Machine.LocalTimeSource.ExecuteInNearestSyncedState(_ => ProcessDataCommand(sdCard, command));
+                // Need to delay the data so that firmware never consumes all data before reading the response.
+                // The nearest synced state alone is not enough: when the command is issued at the end of a
+                // quantum it comes a few instructions later, so the transfer completes before the driver has
+                // polled the response. ST's HAL then sends CMD12 from the completion interrupt, which clears
+                // CMDREND, and the interrupted wait for the CMD18/CMD25 response times out. Deferring once
+                // more gives the driver a full quantum to see the response first, as data trails it on hardware.
+                Machine.LocalTimeSource.ExecuteInNearestSyncedState(_ =>
+                    Machine.LocalTimeSource.ExecuteInNearestSyncedState(__ => ProcessDataCommand(sdCard, command)));
                 break;
             case SDCardCommand.SendCardIdentification_CMD2:
             case SDCardCommand.SendRelativeAddress_CMD3:

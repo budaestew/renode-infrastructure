@@ -274,6 +274,8 @@ namespace Antmicro.Renode.Peripherals.SD
         protected uint ReadBuffer()
         {
             var internalBytes = ReadDataBuffer.DequeueRange(4);
+            // A DMA burst can read past the end of the data; BitConverter throws on fewer than 4 bytes
+            Array.Resize(ref internalBytes, 4);
             var val = BitConverter.ToUInt32(internalBytes);
             if(ReadDataBuffer.Count == 0)
             {

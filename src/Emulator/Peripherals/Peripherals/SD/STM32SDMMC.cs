@@ -328,6 +328,18 @@ namespace Antmicro.Renode.Peripherals.SD
 
         private void ProcessRead(SDCard sdCard, uint length = uint.MaxValue, bool ignoreBlockSize = false)
         {
+            // The data phase runs later than the command (next synced state, plus the card read
+            // latency for block reads), so the card may have been unregistered in between - a hot
+            // removal. Reading through the stale reference would hit an image file that is already
+            // closed and take the whole emulator down. On hardware the data never arrives and the
+            // DPSM stops on its data timeout; DTIMEOUT is not modelled, so stop receiving and leave
+            // the transfer incomplete for the driver's own timeout to catch.
+            if(RegisteredPeripheral != sdCard)
+            {
+                this.WarningLog("SD card was removed before the data phase of a read, dropping the transfer");
+                rxActive = false;
+                return;
+            }
             if(!dataDirectionFromCard.Value)
             {
                 this.WarningLog("Read transfer while DTDIR is set");
